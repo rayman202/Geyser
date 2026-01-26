@@ -1,0 +1,100 @@
+name: Compilar Geyser 3.0 (Surgical V3)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 8 * * *'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configurar Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Instalar LibFakeTime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfaketime
+      # --- PASO 1: LISTA DE CONTRABANDO ---
+      # Añadimos 'tiny-remapper' que fue lo que falló en el último intento.
+      - name: Crear Script de Cache
+        run: |
+          mkdir -p warmup
+          cat <<EOF > warmup/build.gradle
+          plugins { id 'java' }
+          repositories {
+              maven { url "https://maven.architectury.dev/" }
+              gradlePluginPortal()
+              mavenCentral()
+          }
+          configurations { warmup }
+          dependencies {
+              // 1. Plugins Principales
+              warmup("architectury-plugin:architectury-plugin.gradle.plugin:3.4.162") { transitive = false }
+              warmup("dev.architectury.loom:dev.architectury.loom.gradle.plugin:1.13.457") { transitive = false }
+              warmup("dev.architectury.loom-companion:dev.architectury.loom-companion.gradle.plugin:1.13.467") { transitive = false }
+              
+              // 2. Dependencias Internas (El archivo que faltaba)
+              warmup("dev.architectury:tiny-remapper:1.1.0") { transitive = false }
+              
+              // 3. Jars Base
+              warmup("architectury-plugin:architectury-plugin:3.4.162") { transitive = false }
+              warmup("dev.architectury:architectury-loom:1.13.457") { transitive = false }
+              warmup("dev.architectury:architectury-loom:1.13.467") { transitive = false }
+          }
+          task cacheIt {
+              doLast {
+                  configurations.warmup.dependencies.each { dep ->
+                      try {
+                          def files = configurations.warmup.files(dep)
+                          println ">>> CACHEADO: " + dep.toString()
+                      } catch (Exception e) {
+                          println ">>> ERROR (Ignorado): " + dep.toString()
+                      }
+                  }
+              }
+          }
+          EOF
+          touch warmup/settings.gradle
+      # --- PASO 2: VIAJE AL 7 DE ENERO ---
+      - name: "Fase 1: Llenar Caché (7 Enero)"
+        run: |
+          LIBFAKETIME_PATH=$(find /usr/lib -name "libfaketime.so.1" | head -n 1)
+          export LD_PRELOAD="$LIBFAKETIME_PATH"
+          export DONT_FAKE_MONOTONIC=1
+          export FAKETIME="@2026-01-07 12:00:00"
+          
+          echo ">>> VIAJANDO AL PASADO: $(date)"
+          
+          # Descargamos todo lo de la lista
+          ./gradlew -p warmup cacheIt --no-daemon || true
+      - name: Forzar Puerto 25565
+        run: |
+          archivo="bootstrap/bungeecord/src/main/java/org/geysermc/geyser/platform/bungeecord/GeyserBungeePlugin.java"
+          sed -i 's/return findCompatibleListener().*mapToInt.*;/return 25565;/g' $archivo
+          grep -C 5 "getServerPort" $archivo
+      - name: Dar permisos
+        run: chmod +x gradlew
+
+      # --- PASO 3: VOLVER AL PRESENTE ---
+      - name: "Fase 2: Compilación Real (Presente)"
+        run: |
+          unset LD_PRELOAD
+          unset FAKETIME
+          
+          echo ">>> VOLVIENDO AL PRESENTE: $(date)"
+          
+          ./gradlew :bungeecord:build -x test --no-daemon --stacktrace
+      - name: Subir el archivo compilado
+        uses: actions/upload-artifact@v4
+        with:
+          name: Geyser-Bungee-Puerto-25565
+          path: bootstrap/bungeecord/build/libs/*jar
